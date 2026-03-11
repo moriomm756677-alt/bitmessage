@@ -4,6 +4,8 @@ A decentralized, encrypted messaging client implementing the [Bitmessage protoco
 
 Built with **Rust** + **egui** for the GUI.
 
+![Bitmessage-RS](screenshot.png)
+
 ## Features
 
 - Full Bitmessage protocol v3 implementation
