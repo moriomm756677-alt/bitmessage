@@ -35,7 +35,7 @@ pub const MAX_INV_COUNT: usize = 50_000;
 pub const MAX_TIME_OFFSET: i64 = 3_600;
 pub const ADDRESS_ALIVE_SECONDS: u64 = 10_800; // 3 hours
 pub const MAX_TTL: u64 = 28 * 24 * 3600 + 3 * 3600; // 28 days + 3 hours
-pub const USER_AGENT: &str = "/bitmessage-rs:0.1.0/";
+pub const USER_AGENT: &str = "/bitmessage-rs:0.5.0/";
 
 pub mod services {
     pub const NODE_NETWORK: u64 = 1;

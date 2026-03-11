@@ -66,6 +66,8 @@ pub mod icon {
     pub const ATTACH: &str = "\u{25C7}";   // Diamond outline (◇)
     pub const DOWNLOAD: &str = "\u{2193}"; // Downwards arrow (↓)
     pub const FILE: &str = "\u{25A1}";     // White square (□)
+    pub const SAVE: &str = "\u{21E3}";     // Downwards dashed arrow (⇣)
+    pub const IMPORT: &str = "\u{21E0}";   // Leftwards dashed arrow (⇠)
 }
 
 /// Load system fonts with broad Unicode coverage

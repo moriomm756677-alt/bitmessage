@@ -24,6 +24,118 @@ pub fn render_identities(app: &mut BitmessageApp, ui: &mut egui::Ui) {
                     app.show_create_identity = true;
                     app.new_identity_label.clear();
                 }
+
+                // Import identities from JSON file
+                if ui
+                    .add(theme::subtle_button(&theme::icon_text(icon::ADD, "Import")))
+                    .clicked()
+                {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("JSON", &["json"])
+                        .pick_file()
+                    {
+                        match std::fs::read_to_string(&path) {
+                            Ok(json_str) => {
+                                match serde_json::from_str::<Vec<crate::storage::ExportedIdentity>>(&json_str) {
+                                    Ok(exported) => {
+                                        let import_result = {
+                                            if let Ok(db) = app.db.lock() {
+                                                Some(db.import_identities(&exported))
+                                            } else {
+                                                None
+                                            }
+                                        };
+                                        if let Some(result) = import_result {
+                                            match result {
+                                                Ok(count) => {
+                                                    app.notifications.push((
+                                                        format!("Imported {} identities", count),
+                                                        std::time::Instant::now(),
+                                                    ));
+                                                    app.refresh_data();
+                                                }
+                                                Err(e) => {
+                                                    app.notifications.push((
+                                                        format!("Import error: {e}"),
+                                                        std::time::Instant::now(),
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        app.notifications.push((
+                                            format!("Invalid JSON: {e}"),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                app.notifications.push((
+                                    format!("Failed to read file: {e}"),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                // Export all identities to JSON file
+                if ui
+                    .add(theme::subtle_button(&theme::icon_text(icon::SAVE, "Export All")))
+                    .clicked()
+                {
+                    let export_result = {
+                        if let Ok(db) = app.db.lock() {
+                            Some(db.export_identities())
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(result) = export_result {
+                        match result {
+                            Ok(exported) => {
+                                match serde_json::to_string_pretty(&exported) {
+                                    Ok(json_str) => {
+                                        if let Some(path) = rfd::FileDialog::new()
+                                            .set_file_name("bitmessage_identities.json")
+                                            .add_filter("JSON", &["json"])
+                                            .save_file()
+                                        {
+                                            match std::fs::write(&path, json_str) {
+                                                Ok(()) => {
+                                                    app.notifications.push((
+                                                        format!("Exported {} identities", exported.len()),
+                                                        std::time::Instant::now(),
+                                                    ));
+                                                }
+                                                Err(e) => {
+                                                    app.notifications.push((
+                                                        format!("Failed to write file: {e}"),
+                                                        std::time::Instant::now(),
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        app.notifications.push((
+                                            format!("Serialization error: {e}"),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                app.notifications.push((
+                                    format!("Export error: {e}"),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                        }
+                    }
+                }
             });
         });
     });

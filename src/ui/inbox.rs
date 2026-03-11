@@ -24,6 +24,13 @@ fn render_message_list(app: &mut BitmessageApp, ui: &mut egui::Ui, title: &str, 
         _ => return,
     };
 
+    let total_count = match folder {
+        "inbox" => app.total_inbox,
+        "sent" => app.total_sent,
+        "trash" => app.total_trash,
+        _ => 0,
+    };
+
     let msg_count = messages.len();
     let sel_count = app.selected_messages.len();
 
@@ -194,6 +201,51 @@ fn render_message_list(app: &mut BitmessageApp, ui: &mut egui::Ui, title: &str, 
                 let is_unread = !msg.read && folder == "inbox";
                 render_message_row(app, ui, msg, is_unread, folder);
             }
+
+            // Pagination controls
+            if total_count > app.page_size {
+                ui.add_space(8.0);
+                egui::Frame {
+                    fill: theme::BG_SURFACE,
+                    inner_margin: egui::Margin::symmetric(16.0, 8.0),
+                    ..Default::default()
+                }
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let current_page = (app.page_offset / app.page_size) + 1;
+                        let total_pages = (total_count + app.page_size - 1) / app.page_size;
+
+                        ui.add_enabled_ui(app.page_offset > 0, |ui| {
+                            if ui.add(theme::subtle_button(&theme::icon_text(icon::BACK, "Prev"))).clicked() {
+                                app.page_offset = (app.page_offset - app.page_size).max(0);
+                                app.refresh_data();
+                            }
+                        });
+
+                        ui.label(
+                            RichText::new(format!("Page {current_page} / {total_pages}"))
+                                .color(theme::TEXT_SECONDARY)
+                                .size(12.0),
+                        );
+
+                        ui.add_enabled_ui(app.page_offset + app.page_size < total_count, |ui| {
+                            if ui.add(theme::subtle_button("Next")).clicked() {
+                                app.page_offset += app.page_size;
+                                app.refresh_data();
+                            }
+                        });
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(format!("{total_count} total"))
+                                    .color(theme::TEXT_DIM)
+                                    .size(11.0),
+                            );
+                        });
+                    });
+                });
+            }
+
             ui.add_space(8.0);
         });
 }

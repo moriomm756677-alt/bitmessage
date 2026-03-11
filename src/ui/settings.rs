@@ -34,7 +34,11 @@ pub fn render_settings(app: &mut BitmessageApp, ui: &mut egui::Ui) {
                             .color(theme::TEXT_DIM)
                             .size(13.0),
                     );
-                    ui.label(RichText::new("8").size(13.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut app.setting_max_connections)
+                            .desired_width(60.0)
+                            .font(egui::TextStyle::Body),
+                    );
                 });
 
                 ui.horizontal(|ui| {
@@ -55,7 +59,11 @@ pub fn render_settings(app: &mut BitmessageApp, ui: &mut egui::Ui) {
                             .color(theme::TEXT_DIM)
                             .size(13.0),
                     );
-                    ui.label(RichText::new("1000").size(13.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut app.setting_nonce_trials)
+                            .desired_width(80.0)
+                            .font(egui::TextStyle::Body),
+                    );
                 });
 
                 ui.horizontal(|ui| {
@@ -64,7 +72,11 @@ pub fn render_settings(app: &mut BitmessageApp, ui: &mut egui::Ui) {
                             .color(theme::TEXT_DIM)
                             .size(13.0),
                     );
-                    ui.label(RichText::new("1000").size(13.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut app.setting_extra_bytes)
+                            .desired_width(80.0)
+                            .font(egui::TextStyle::Body),
+                    );
                 });
             });
 
@@ -72,11 +84,15 @@ pub fn render_settings(app: &mut BitmessageApp, ui: &mut egui::Ui) {
             settings_section(ui, &theme::icon_text(icon::INBOX, "Messages"), |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("Default TTL:")
+                        RichText::new("Default TTL (days):")
                             .color(theme::TEXT_DIM)
                             .size(13.0),
                     );
-                    ui.label(RichText::new("4 days").size(13.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut app.setting_default_ttl_days)
+                            .desired_width(60.0)
+                            .font(egui::TextStyle::Body),
+                    );
                 });
 
                 ui.horizontal(|ui| {
@@ -87,6 +103,113 @@ pub fn render_settings(app: &mut BitmessageApp, ui: &mut egui::Ui) {
                     );
                     ui.label(RichText::new("Simple (type 2)").size(13.0));
                 });
+            });
+
+            // Save button
+            ui.add_space(8.0);
+            egui::Frame {
+                fill: theme::BG_PANEL,
+                inner_margin: egui::Margin::symmetric(20.0, 12.0),
+                rounding: egui::Rounding::same(8.0),
+                outer_margin: egui::Margin::symmetric(16.0, 4.0),
+                stroke: egui::Stroke::new(0.5, theme::BORDER),
+                ..Default::default()
+            }
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                if ui.add(theme::accent_button(&theme::icon_text(icon::CHECK, "Save Settings"))).clicked() {
+                    if let Ok(db) = app.db.lock() {
+                        let _ = db.set_setting("max_connections", &app.setting_max_connections);
+                        let _ = db.set_setting("nonce_trials", &app.setting_nonce_trials);
+                        let _ = db.set_setting("extra_bytes", &app.setting_extra_bytes);
+                        let _ = db.set_setting("default_ttl_days", &app.setting_default_ttl_days);
+                    }
+                    app.notifications.push((
+                        format!("{} Settings saved", super::theme::icon::CHECK),
+                        std::time::Instant::now(),
+                    ));
+                }
+            });
+
+            // Security
+            settings_section(ui, &theme::icon_text(icon::LOCK, "Security"), |ui| {
+                if app.keys_encrypted {
+                    ui.label(
+                        RichText::new("Private keys are encrypted")
+                            .color(theme::SUCCESS)
+                            .size(13.0),
+                    );
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Password:").color(theme::TEXT_DIM).size(13.0));
+                        ui.add(egui::TextEdit::singleline(&mut app.password_input)
+                            .password(true)
+                            .hint_text("Enter password")
+                            .desired_width(200.0));
+                    });
+                    if ui.add(theme::subtle_button("Remove Encryption")).clicked() {
+                        if !app.password_input.is_empty() {
+                            let key = crate::storage::derive_key_from_password(&app.password_input);
+                            if let Ok(db) = app.db.lock() {
+                                match db.decrypt_private_keys(&key) {
+                                    Ok(()) => {
+                                        let _ = db.set_setting("keys_encrypted", "0");
+                                        app.keys_encrypted = false;
+                                        app.notifications.push((
+                                            format!("{} Encryption removed", icon::CHECK),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        app.notifications.push((
+                                            format!("{} Wrong password: {e}", icon::DELETE),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                }
+                            }
+                            app.password_input.clear();
+                            app.refresh_data();
+                        }
+                    }
+                } else {
+                    ui.label(
+                        RichText::new("Private keys are NOT encrypted")
+                            .color(theme::WARNING)
+                            .size(13.0),
+                    );
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("New password:").color(theme::TEXT_DIM).size(13.0));
+                        ui.add(egui::TextEdit::singleline(&mut app.password_input)
+                            .password(true)
+                            .hint_text("Enter password")
+                            .desired_width(200.0));
+                    });
+                    if ui.add(theme::accent_button("Encrypt Keys")).clicked() {
+                        if !app.password_input.is_empty() {
+                            let key = crate::storage::derive_key_from_password(&app.password_input);
+                            if let Ok(db) = app.db.lock() {
+                                match db.encrypt_private_keys(&key) {
+                                    Ok(()) => {
+                                        app.keys_encrypted = true;
+                                        app.notifications.push((
+                                            format!("{} Keys encrypted", icon::CHECK),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        app.notifications.push((
+                                            format!("{} Error: {e}", icon::DELETE),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                }
+                            }
+                            app.password_input.clear();
+                        }
+                    }
+                }
             });
 
             // About

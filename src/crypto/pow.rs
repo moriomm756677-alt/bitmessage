@@ -120,10 +120,11 @@ fn try_nonce(nonce: u64, initial_hash: &[u8; 64]) -> u64 {
     ])
 }
 
-/// Multithreaded PoW with progress callback.
+/// Multithreaded PoW with progress callback and cancellation support.
 /// Splits the nonce space across all available CPU cores.
 /// The callback receives the total number of attempts so far.
-pub fn do_pow_with_progress<F>(payload: &[u8], target: u64, on_progress: F) -> u64
+/// Returns `None` if cancelled, `Some(nonce)` if a valid nonce was found.
+pub fn do_pow_with_progress<F>(payload: &[u8], target: u64, on_progress: F, cancelled: Arc<AtomicBool>) -> Option<u64>
 where
     F: FnMut(u64) + Send,
 {
@@ -144,6 +145,7 @@ where
             let result_nonce = Arc::clone(&result_nonce);
             let total_attempts = Arc::clone(&total_attempts);
             let on_progress = Arc::clone(&on_progress);
+            let cancelled = Arc::clone(&cancelled);
             let initial_hash = initial_hash;
 
             s.spawn(move || {
@@ -151,7 +153,7 @@ where
                 let step = num_threads as u64;
                 let mut local_count: u64 = 0;
 
-                while !found.load(Ordering::Relaxed) {
+                while !found.load(Ordering::Relaxed) && !cancelled.load(Ordering::Relaxed) {
                     let trial_value = try_nonce(nonce, &initial_hash);
 
                     if trial_value <= target {
@@ -177,7 +179,11 @@ where
         }
     });
 
-    result_nonce.load(Ordering::Relaxed)
+    if cancelled.load(Ordering::Relaxed) {
+        None
+    } else {
+        Some(result_nonce.load(Ordering::Relaxed))
+    }
 }
 
 #[cfg(test)]
@@ -199,7 +205,8 @@ mod tests {
     fn test_parallel_pow() {
         let payload = b"test parallel pow computation";
         let target = calculate_target(payload.len() as u64 + 8, 3600, 1000, 1000);
-        let nonce = do_pow_with_progress(payload, target, |_| {});
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let nonce = do_pow_with_progress(payload, target, |_| {}, cancelled).unwrap();
 
         let mut full = nonce.to_be_bytes().to_vec();
         full.extend_from_slice(payload);

@@ -83,6 +83,13 @@ pub struct BitmessageApp {
     pub selected_msg_id: Option<i64>,
     pub selected_messages: std::collections::HashSet<i64>,
 
+    // Pagination
+    pub page_offset: i64,
+    pub page_size: i64,
+    pub total_inbox: i64,
+    pub total_sent: i64,
+    pub total_trash: i64,
+
     // Dialogs
     pub show_add_contact: bool,
     pub new_contact_label: String,
@@ -124,6 +131,19 @@ pub struct BitmessageApp {
     pub logo_texture: Option<TextureHandle>,
     pub tor_icon_texture: Option<TextureHandle>,
 
+    // Error dialog
+    pub error_message: Option<(String, std::time::Instant)>,
+
+    // Settings (loaded from DB)
+    pub setting_max_connections: String,
+    pub setting_nonce_trials: String,
+    pub setting_extra_bytes: String,
+    pub setting_default_ttl_days: String,
+
+    // Security
+    pub password_input: String,
+    pub show_password_dialog: bool,
+    pub keys_encrypted: bool,
 }
 
 impl BitmessageApp {
@@ -153,6 +173,11 @@ impl BitmessageApp {
             search_query: String::new(),
             selected_msg_id: None,
             selected_messages: std::collections::HashSet::new(),
+            page_offset: 0,
+            page_size: 50,
+            total_inbox: 0,
+            total_sent: 0,
+            total_trash: 0,
             show_add_contact: false,
             new_contact_label: String::new(),
             new_contact_address: String::new(),
@@ -182,8 +207,24 @@ impl BitmessageApp {
             minimized_to_tray: false,
             logo_texture: None,
             tor_icon_texture: None,
+            error_message: None,
+            setting_max_connections: "8".into(),
+            setting_nonce_trials: "1000".into(),
+            setting_extra_bytes: "1000".into(),
+            setting_default_ttl_days: "4".into(),
+            password_input: String::new(),
+            show_password_dialog: false,
+            keys_encrypted: false,
         };
         app.refresh_data();
+        // Load persisted settings from DB
+        if let Ok(db) = app.db.lock() {
+            app.setting_max_connections = db.get_setting("max_connections").unwrap_or_else(|| "8".into());
+            app.setting_nonce_trials = db.get_setting("nonce_trials").unwrap_or_else(|| "1000".into());
+            app.setting_extra_bytes = db.get_setting("extra_bytes").unwrap_or_else(|| "1000".into());
+            app.setting_default_ttl_days = db.get_setting("default_ttl_days").unwrap_or_else(|| "4".into());
+            app.keys_encrypted = db.are_keys_encrypted();
+        }
         app
     }
 
@@ -191,9 +232,12 @@ impl BitmessageApp {
         if let Ok(db) = self.db.lock() {
             self.identities = db.get_identities().unwrap_or_default();
             self.contacts = db.get_contacts().unwrap_or_default();
-            self.inbox = db.get_messages_by_folder("inbox").unwrap_or_default();
-            self.sent = db.get_messages_by_folder("sent").unwrap_or_default();
-            self.trash = db.get_messages_by_folder("trash").unwrap_or_default();
+            self.inbox = db.get_messages_by_folder_paged("inbox", self.page_size, self.page_offset).unwrap_or_default();
+            self.sent = db.get_messages_by_folder_paged("sent", self.page_size, self.page_offset).unwrap_or_default();
+            self.trash = db.get_messages_by_folder_paged("trash", self.page_size, self.page_offset).unwrap_or_default();
+            self.total_inbox = db.count_messages_by_folder("inbox").unwrap_or(0);
+            self.total_sent = db.count_messages_by_folder("sent").unwrap_or(0);
+            self.total_trash = db.count_messages_by_folder("trash").unwrap_or(0);
             self.channels = db.get_channels().unwrap_or_default();
             self.subscriptions = db.get_subscriptions().unwrap_or_default();
             self.blacklist = db.get_blacklist().unwrap_or_default();
@@ -224,6 +268,7 @@ impl BitmessageApp {
                     self.refresh_data();
                 }
                 NetworkEvent::Error(e) => {
+                    self.error_message = Some((e.clone(), std::time::Instant::now()));
                     self.notifications
                         .push((format!("{} {e}", icon::DELETE), std::time::Instant::now()));
                 }
@@ -427,7 +472,9 @@ impl BitmessageApp {
 
         if response.interact(egui::Sense::click()).clicked() {
             self.selected_messages.clear();
+            self.page_offset = 0;
             self.current_view = view;
+            self.refresh_data();
         }
     }
 
@@ -548,6 +595,34 @@ impl eframe::App for BitmessageApp {
                 ..Default::default()
             })
             .show(ctx, |ui| {
+                // Error banner
+                let mut dismiss_error = false;
+                if let Some((ref msg, instant)) = self.error_message {
+                    if instant.elapsed() < std::time::Duration::from_secs(10) {
+                        egui::Frame {
+                            fill: Color32::from_rgb(80, 20, 20),
+                            inner_margin: egui::Margin::symmetric(16.0, 10.0),
+                            rounding: egui::Rounding::same(6.0),
+                            outer_margin: egui::Margin::symmetric(16.0, 4.0),
+                            ..Default::default()
+                        }
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(icon::DELETE).color(theme::ERROR).size(14.0));
+                                ui.label(RichText::new(msg).color(theme::ERROR).size(13.0));
+                                if ui.add(theme::subtle_button("Dismiss")).clicked() {
+                                    dismiss_error = true;
+                                }
+                            });
+                        });
+                    } else {
+                        dismiss_error = true;
+                    }
+                }
+                if dismiss_error {
+                    self.error_message = None;
+                }
+
                 let view = self.current_view.clone();
                 match view {
                     View::Inbox => super::inbox::render_inbox(self, ui),

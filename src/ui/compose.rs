@@ -89,6 +89,19 @@ pub fn render_compose(app: &mut BitmessageApp, ui: &mut egui::Ui) {
                         );
                     });
 
+                    // Address validation
+                    if !app.compose.to.is_empty() && !app.compose.is_broadcast {
+                        let valid = app.compose.to.starts_with("BM-")
+                            && crate::crypto::address::BitmessageAddress::decode(&app.compose.to).is_ok();
+                        if !valid {
+                            ui.label(
+                                RichText::new("Invalid Bitmessage address")
+                                    .color(theme::ERROR)
+                                    .size(11.0),
+                            );
+                        }
+                    }
+
                     // Quick contact picker
                     if !app.contacts.is_empty() && app.compose.to.is_empty() {
                         ui.add_space(4.0);
@@ -239,8 +252,12 @@ pub fn render_compose(app: &mut BitmessageApp, ui: &mut egui::Ui) {
 
                 // Send button
                 ui.horizontal(|ui| {
+                    let to_valid = app.compose.is_broadcast
+                        || (app.compose.to.starts_with("BM-")
+                            && crate::crypto::address::BitmessageAddress::decode(&app.compose.to).is_ok());
                     let can_send = !app.identities.is_empty()
                         && (app.compose.is_broadcast || !app.compose.to.is_empty())
+                        && to_valid
                         && (!app.compose.body.is_empty() || app.compose.attached_file.is_some());
 
                     ui.add_enabled_ui(can_send, |ui| {

@@ -113,6 +113,20 @@ pub struct StoredAttachment {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ExportedIdentity {
+    pub label: String,
+    pub address: String,
+    pub signing_key: String,
+    pub encryption_key: String,
+    pub pub_signing_key: String,
+    pub pub_encryption_key: String,
+    pub address_version: i64,
+    pub stream_number: i64,
+    pub nonce_trials: i64,
+    pub extra_bytes: i64,
+}
+
 // --- Database ---
 
 pub struct Database {
@@ -126,6 +140,11 @@ impl Database {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(&path)?;
+        conn.execute_batch("
+            PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=NORMAL;
+            PRAGMA busy_timeout=5000;
+        ")?;
         let db = Self { conn };
         db.init_tables()?;
         Ok(db)
@@ -268,6 +287,11 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_chunks_transfer_id
                 ON attachment_chunks(transfer_id);
+            CREATE INDEX IF NOT EXISTS idx_messages_from ON messages(from_address);
+            CREATE INDEX IF NOT EXISTS idx_messages_to ON messages(to_address);
+            CREATE INDEX IF NOT EXISTS idx_messages_folder ON messages(folder);
+            CREATE INDEX IF NOT EXISTS idx_inventory_expires ON inventory(expires_time);
+            CREATE INDEX IF NOT EXISTS idx_pubkeys_expires ON pubkeys(expires_time);
             ",
         )?;
 
@@ -281,17 +305,25 @@ impl Database {
             "ALTER TABLE inventory ADD COLUMN processed INTEGER NOT NULL DEFAULT 0", [],
         );
 
-        // Migration: fix identity addresses (compute_ripe now includes 0x04 prefix)
-        self.migrate_identity_addresses()?;
-
-        // One-time migration: reset processed flag so fixed decryption code retries all objects
         let version: i64 = self.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
+
+        // Migration v1: reset processed flag so fixed decryption code retries all objects
         if version < 1 {
             log::info!("Migration v1: resetting processed flag on MSG/BROADCAST inventory for re-decryption");
             let _ = self.conn.execute(
                 "UPDATE inventory SET processed = 0 WHERE object_type IN (2, 3)", [],
             );
-            let _ = self.conn.execute("PRAGMA user_version = 1", []);
+        }
+
+        // Migration v2: fix identity addresses (compute_ripe now includes 0x04 prefix)
+        if version < 2 {
+            log::info!("Migration v2: fixing identity addresses");
+            self.migrate_identity_addresses()?;
+        }
+
+        // Update to latest version
+        if version < 2 {
+            let _ = self.conn.execute("PRAGMA user_version = 2", []);
         }
 
         Ok(())
@@ -505,12 +537,16 @@ impl Database {
     }
 
     pub fn get_messages_by_folder(&self, folder: &str) -> Result<Vec<StoredMessage>, DbError> {
+        self.get_messages_by_folder_paged(folder, 200, 0)
+    }
+
+    pub fn get_messages_by_folder_paged(&self, folder: &str, limit: i64, offset: i64) -> Result<Vec<StoredMessage>, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, msgid, from_address, to_address, subject, body,
              encoding, status, folder, read, created_at
-             FROM messages WHERE folder = ?1 ORDER BY created_at DESC",
+             FROM messages WHERE folder = ?1 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
         )?;
-        let rows = stmt.query_map(params![folder], |row| {
+        let rows = stmt.query_map(params![folder, limit, offset], |row| {
             Ok(StoredMessage {
                 id: row.get(0)?,
                 msgid: row.get(1)?,
@@ -526,6 +562,15 @@ impl Database {
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn count_messages_by_folder(&self, folder: &str) -> Result<i64, DbError> {
+        let count = self.conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE folder = ?1",
+            params![folder],
+            |row| row.get(0),
+        )?;
+        Ok(count)
     }
 
     pub fn get_message_by_id(&self, id: i64) -> Result<Option<StoredMessage>, DbError> {
@@ -1274,6 +1319,153 @@ impl Database {
             |row| row.get::<_, i64>(0),
         ).unwrap_or(0) > 0
     }
+
+    /// Export all identities as JSON-like string for backup
+    pub fn export_identities(&self) -> Result<Vec<ExportedIdentity>, DbError> {
+        let identities = self.get_identities()?;
+        Ok(identities.into_iter().map(|id| ExportedIdentity {
+            label: id.label,
+            address: id.address,
+            signing_key: hex::encode(&id.signing_key),
+            encryption_key: hex::encode(&id.encryption_key),
+            pub_signing_key: hex::encode(&id.pub_signing_key),
+            pub_encryption_key: hex::encode(&id.pub_encryption_key),
+            address_version: id.address_version,
+            stream_number: id.stream_number,
+            nonce_trials: id.nonce_trials,
+            extra_bytes: id.extra_bytes,
+        }).collect())
+    }
+
+    /// Import identities from exported data
+    pub fn import_identities(&self, identities: &[ExportedIdentity]) -> Result<usize, DbError> {
+        let mut imported = 0;
+        let now = chrono::Utc::now().timestamp();
+        for id in identities {
+            let signing_key = hex::decode(&id.signing_key).map_err(|_| DbError::Sqlite(rusqlite::Error::InvalidParameterName("bad hex".into())))?;
+            let encryption_key = hex::decode(&id.encryption_key).map_err(|_| DbError::Sqlite(rusqlite::Error::InvalidParameterName("bad hex".into())))?;
+            let pub_signing_key = hex::decode(&id.pub_signing_key).map_err(|_| DbError::Sqlite(rusqlite::Error::InvalidParameterName("bad hex".into())))?;
+            let pub_encryption_key = hex::decode(&id.pub_encryption_key).map_err(|_| DbError::Sqlite(rusqlite::Error::InvalidParameterName("bad hex".into())))?;
+
+            let result = self.conn.execute(
+                "INSERT OR IGNORE INTO identities (label, address, signing_key, encryption_key,
+                 pub_signing_key, pub_encryption_key, address_version, stream_number,
+                 enabled, nonce_trials, extra_bytes, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11)",
+                params![
+                    id.label, id.address, signing_key, encryption_key,
+                    pub_signing_key, pub_encryption_key,
+                    id.address_version, id.stream_number,
+                    id.nonce_trials, id.extra_bytes, now,
+                ],
+            )?;
+            if result > 0 { imported += 1; }
+        }
+        Ok(imported)
+    }
+
+    /// Encrypt private keys for all identities with a password hash
+    pub fn encrypt_private_keys(&self, password_hash: &[u8; 32]) -> Result<(), DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, signing_key, encryption_key FROM identities"
+        )?;
+        let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?.filter_map(|r| r.ok()).collect();
+
+        for (id, sign_key, enc_key) in rows {
+            // Skip if already encrypted (encrypted keys will be longer due to IV + padding)
+            if sign_key.len() != 32 || enc_key.len() != 32 {
+                continue;
+            }
+            let encrypted_sign = simple_encrypt(password_hash, &sign_key);
+            let encrypted_enc = simple_encrypt(password_hash, &enc_key);
+            self.conn.execute(
+                "UPDATE identities SET signing_key = ?1, encryption_key = ?2 WHERE id = ?3",
+                params![encrypted_sign, encrypted_enc, id],
+            )?;
+        }
+        self.set_setting("keys_encrypted", "1")?;
+        Ok(())
+    }
+
+    /// Decrypt private keys with password hash
+    pub fn decrypt_private_keys(&self, password_hash: &[u8; 32]) -> Result<(), DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, signing_key, encryption_key FROM identities"
+        )?;
+        let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?.filter_map(|r| r.ok()).collect();
+
+        for (id, sign_key, enc_key) in rows {
+            // Skip if not encrypted (raw keys are 32 bytes)
+            if sign_key.len() == 32 && enc_key.len() == 32 {
+                continue;
+            }
+            let decrypted_sign = simple_decrypt(password_hash, &sign_key)
+                .map_err(|_| DbError::Sqlite(rusqlite::Error::InvalidParameterName("decryption failed".into())))?;
+            let decrypted_enc = simple_decrypt(password_hash, &enc_key)
+                .map_err(|_| DbError::Sqlite(rusqlite::Error::InvalidParameterName("decryption failed".into())))?;
+            self.conn.execute(
+                "UPDATE identities SET signing_key = ?1, encryption_key = ?2 WHERE id = ?3",
+                params![decrypted_sign, decrypted_enc, id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Check if keys are encrypted
+    pub fn are_keys_encrypted(&self) -> bool {
+        self.get_setting("keys_encrypted").map(|v| v == "1").unwrap_or(false)
+    }
+}
+
+/// Simple AES-256-CBC encryption with random IV
+fn simple_encrypt(key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
+    use aes::cipher::{BlockEncryptMut, KeyIvInit};
+    use cipher::block_padding::Pkcs7;
+    type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
+
+    let iv: [u8; 16] = rand::random();
+    let encryptor = Aes256CbcEnc::new(key.into(), &iv.into());
+    let mut buffer = vec![0u8; plaintext.len() + 16]; // room for padding
+    buffer[..plaintext.len()].copy_from_slice(plaintext);
+    let ciphertext = encryptor.encrypt_padded_mut::<Pkcs7>(&mut buffer, plaintext.len()).unwrap();
+    let mut result = Vec::with_capacity(16 + ciphertext.len());
+    result.extend_from_slice(&iv);
+    result.extend_from_slice(ciphertext);
+    result
+}
+
+/// Simple AES-256-CBC decryption
+fn simple_decrypt(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, &'static str> {
+    use aes::cipher::{BlockDecryptMut, KeyIvInit};
+    use cipher::block_padding::Pkcs7;
+    type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
+
+    if data.len() < 17 { // at least IV + 1 block
+        return Err("data too short");
+    }
+    let iv = &data[..16];
+    let ciphertext = &data[16..];
+    let decryptor = Aes256CbcDec::new(key.into(), iv.into());
+    let mut buffer = ciphertext.to_vec();
+    let plaintext = decryptor.decrypt_padded_mut::<Pkcs7>(&mut buffer)
+        .map_err(|_| "decryption failed")?;
+    Ok(plaintext.to_vec())
+}
+
+/// Derive a 32-byte key from a password using SHA-256
+pub fn derive_key_from_password(password: &str) -> [u8; 32] {
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    hasher.update(password.as_bytes());
+    hasher.update(b"bitmessage-rs-key-derivation");
+    let result = hasher.finalize();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&result);
+    key
 }
 
 fn dirs_or_default() -> PathBuf {

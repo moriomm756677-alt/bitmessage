@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{timeout, Duration};
@@ -25,6 +26,9 @@ const RETRY_QUEUED_INTERVAL: Duration = Duration::from_secs(60);
 const STATS_INTERVAL: Duration = Duration::from_secs(5);
 const DOWNLOAD_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT_SECS: u64 = 60;
+const MAX_SEEN_INV: usize = 500_000;
+const MAX_MISSING_OBJECTS: usize = 50_000;
+const MAX_SENT_ACKS: usize = 10_000;
 
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
@@ -75,11 +79,23 @@ pub struct PeerManager {
     // Pending reprocess queue (loaded once, drained in batches)
     reprocess_queue: Vec<(Vec<u8>, Vec<u8>)>, // (hash, payload)
     reprocess_decrypted: u32,
+    // Track sent ACK hashes to prevent broadcasting duplicate ACKs
+    sent_acks: HashSet<[u8; 32]>,
+    // Consecutive connection failures for exponential backoff
+    consecutive_failures: u32,
+    // Peer reputation scores
+    peer_scores: HashMap<String, PeerScore>,
 }
 
 struct MissingObject {
     requested_at: u64,
     from_peer: String,
+}
+
+struct PeerScore {
+    successful_objects: u64,
+    failed_requests: u64,
+    last_seen: u64,
 }
 
 enum PeerIncoming {
@@ -123,7 +139,30 @@ impl PeerManager {
             bytes_received: 0,
             reprocess_queue: Vec::new(),
             reprocess_decrypted: 0,
+            sent_acks: HashSet::new(),
+            consecutive_failures: 0,
+            peer_scores: HashMap::new(),
         }
+    }
+
+    fn update_peer_score(&mut self, addr: &str, success: bool) {
+        let score = self.peer_scores.entry(addr.to_string()).or_insert(PeerScore {
+            successful_objects: 0,
+            failed_requests: 0,
+            last_seen: unix_time(),
+        });
+        if success {
+            score.successful_objects += 1;
+        } else {
+            score.failed_requests += 1;
+        }
+        score.last_seen = unix_time();
+    }
+
+    fn peer_score_value(&self, addr: &str) -> i64 {
+        self.peer_scores.get(addr).map(|s| {
+            s.successful_objects as i64 - s.failed_requests as i64 * 3
+        }).unwrap_or(0)
     }
 
     /// Bootstrap the Tor client
@@ -243,13 +282,16 @@ impl PeerManager {
                     }
 
                     // Reconnection: actively maintain peer count
-                    let reconnect_interval = if self.peers.is_empty() && self.pending_connections == 0 {
+                    let base_interval = if self.peers.is_empty() && self.pending_connections == 0 {
                         Duration::from_secs(15)
                     } else if self.peers.len() < 3 {
                         Duration::from_secs(30)
                     } else {
                         RECONNECT_INTERVAL
                     };
+                    // Exponential backoff: up to 5 min max
+                    let backoff_factor = 2u64.pow(self.consecutive_failures.min(5));
+                    let reconnect_interval = base_interval.mul_f64(backoff_factor as f64).min(Duration::from_secs(300));
                     if now.duration_since(self.last_reconnect) > reconnect_interval {
                         self.last_reconnect = now;
                         if self.peers.len() + self.pending_connections < MAX_PEERS {
@@ -295,6 +337,7 @@ impl PeerManager {
             }
             PeerIncoming::NewConnection { info, writer } => {
                 self.pending_connections = self.pending_connections.saturating_sub(1);
+                self.consecutive_failures = 0;
                 if self.peers.len() >= MAX_PEERS {
                     drop(writer);
                     return;
@@ -316,6 +359,8 @@ impl PeerManager {
             }
             PeerIncoming::ConnectionFailed(addr) => {
                 self.pending_connections = self.pending_connections.saturating_sub(1);
+                self.consecutive_failures += 1;
+                self.update_peer_score(&addr, false);
                 log::debug!("Connection attempt failed: {addr}");
             }
         }
@@ -364,8 +409,16 @@ impl PeerManager {
                 object_type::MSG => {
                     if let Some(ack_data) = self.try_decrypt_message(&header, object_payload, raw_header_for_signing) {
                         self.reprocess_decrypted += 1;
-                        let ack_msg = encode_message("object", &ack_data);
-                        self.broadcast_to_peers(&ack_msg).await;
+                        let ack_inv = InventoryVector::from_object_data(&ack_data);
+                        if !self.sent_acks.contains(&ack_inv.hash) {
+                            if self.sent_acks.len() >= MAX_SENT_ACKS {
+                                let to_keep: HashSet<[u8; 32]> = self.sent_acks.iter().skip(self.sent_acks.len() / 2).copied().collect();
+                                self.sent_acks = to_keep;
+                            }
+                            self.sent_acks.insert(ack_inv.hash);
+                            let ack_msg = encode_message("object", &ack_data);
+                            self.broadcast_to_peers(&ack_msg).await;
+                        }
                     }
                 }
                 object_type::BROADCAST => {
@@ -466,13 +519,20 @@ impl PeerManager {
             spawned += 1;
         }
 
-        // Then try recently-seen known nodes from DB
+        // Then try recently-seen known nodes from DB, preferring higher-scored peers
         let cutoff = chrono::Utc::now().timestamp() - 3 * 24 * 3600;
-        let nodes = if let Ok(db) = self.db.lock() {
+        let mut nodes = if let Ok(db) = self.db.lock() {
             db.get_known_nodes(1).unwrap_or_default()
         } else {
             vec![]
         };
+
+        // Sort by peer reputation score (highest first)
+        nodes.sort_by(|a, b| {
+            let addr_a = format!("{}:{}", a.ip, a.port);
+            let addr_b = format!("{}:{}", b.ip, b.port);
+            self.peer_score_value(&addr_b).cmp(&self.peer_score_value(&addr_a))
+        });
 
         for node in nodes.iter().take(32) {
             if spawned >= target { break; }
@@ -635,23 +695,31 @@ impl PeerManager {
     /// Retry downloading objects that timed out
     async fn retry_downloads(&mut self) {
         let now = unix_time();
-        let to_retry: Vec<[u8; 32]> = self.missing_objects.iter()
+        let to_retry: Vec<([u8; 32], String)> = self.missing_objects.iter()
             .filter(|(_, obj)| now.saturating_sub(obj.requested_at) > REQUEST_TIMEOUT_SECS)
-            .map(|(hash, _)| *hash)
+            .map(|(hash, obj)| (*hash, obj.from_peer.clone()))
             .collect();
 
         if to_retry.is_empty() || self.peers.is_empty() {
             return;
         }
 
-        let peer_addrs: Vec<String> = self.peers.iter()
+        // Record failed score for the peers that timed out
+        let failed_peers: HashSet<String> = to_retry.iter().map(|(_, p)| p.clone()).collect();
+        for peer in &failed_peers {
+            self.update_peer_score(peer, false);
+        }
+
+        // Sort peers by reputation score (highest first) for retry
+        let mut peer_addrs: Vec<String> = self.peers.iter()
             .map(|p| format!("{}:{}", p.info.address, p.info.port))
             .collect();
+        peer_addrs.sort_by(|a, b| self.peer_score_value(b).cmp(&self.peer_score_value(a)));
 
         let now_ts = unix_time();
         let mut requests_per_peer: HashMap<String, Vec<InventoryVector>> = HashMap::new();
 
-        for (i, hash) in to_retry.iter().enumerate() {
+        for (i, (hash, _)) in to_retry.iter().enumerate() {
             let peer = &peer_addrs[i % peer_addrs.len()];
             if let Some(obj) = self.missing_objects.get_mut(hash) {
                 obj.requested_at = now_ts;
@@ -928,24 +996,32 @@ impl PeerManager {
 
         // PoW
         let event_tx = self.event_tx.clone();
-        let pow_result = tokio::task::spawn_blocking(move || {
-            let target = pow::calculate_target(
-                (pow_payload.len() + 8) as u64,
-                DEFAULT_TTL,
-                pow::DEFAULT_NONCE_TRIALS_PER_BYTE,
-                pow::DEFAULT_EXTRA_BYTES,
-            );
-            let nonce = pow::do_pow_with_progress(&pow_payload, target, |n| {
-                let _ = event_tx.send(NetworkEvent::StatusUpdate(format!(
-                    "Computing getpubkey PoW... ({n})"
-                )));
-            });
-            (nonce, pow_payload)
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let pow_result = tokio::task::spawn_blocking({
+            let cancelled = cancelled.clone();
+            move || {
+                let target = pow::calculate_target(
+                    (pow_payload.len() + 8) as u64,
+                    DEFAULT_TTL,
+                    pow::DEFAULT_NONCE_TRIALS_PER_BYTE,
+                    pow::DEFAULT_EXTRA_BYTES,
+                );
+                let nonce = pow::do_pow_with_progress(&pow_payload, target, |n| {
+                    let _ = event_tx.send(NetworkEvent::StatusUpdate(format!(
+                        "Computing getpubkey PoW... ({n})"
+                    )));
+                }, cancelled);
+                (nonce, pow_payload)
+            }
         })
         .await;
 
-        let Ok((nonce, pow_payload)) = pow_result else {
+        let Ok((nonce_opt, pow_payload)) = pow_result else {
             self.send_event(NetworkEvent::Error("Getpubkey PoW failed".into()));
+            return;
+        };
+        let Some(nonce) = nonce_opt else {
+            self.send_event(NetworkEvent::StatusUpdate("Getpubkey PoW cancelled".into()));
             return;
         };
 
@@ -1063,21 +1139,30 @@ impl PeerManager {
         ack_pow_payload.extend_from_slice(&ack_random);
 
         let ack_event_tx = self.event_tx.clone();
-        let ack_pow_result = tokio::task::spawn_blocking(move || {
-            let target = pow::calculate_target(
-                (ack_pow_payload.len() + 8) as u64, DEFAULT_TTL,
-                pow::DEFAULT_NONCE_TRIALS_PER_BYTE, pow::DEFAULT_EXTRA_BYTES,
-            );
-            let nonce = pow::do_pow_with_progress(&ack_pow_payload, target, |n| {
-                let _ = ack_event_tx.send(NetworkEvent::StatusUpdate(
-                    format!("ACK PoW... ({n})")
-                ));
-            });
-            (nonce, ack_pow_payload)
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let ack_pow_result = tokio::task::spawn_blocking({
+            let cancelled = cancelled.clone();
+            move || {
+                let target = pow::calculate_target(
+                    (ack_pow_payload.len() + 8) as u64, DEFAULT_TTL,
+                    pow::DEFAULT_NONCE_TRIALS_PER_BYTE, pow::DEFAULT_EXTRA_BYTES,
+                );
+                let nonce = pow::do_pow_with_progress(&ack_pow_payload, target, |n| {
+                    let _ = ack_event_tx.send(NetworkEvent::StatusUpdate(
+                        format!("ACK PoW... ({n})")
+                    ));
+                }, cancelled);
+                (nonce, ack_pow_payload)
+            }
         }).await;
 
-        let Ok((ack_nonce, ack_pow_payload)) = ack_pow_result else {
+        let Ok((ack_nonce_opt, ack_pow_payload)) = ack_pow_result else {
             self.send_event(NetworkEvent::Error("ACK PoW failed".into()));
+            self.reset_msg_status(existing_msgid, "msgqueued");
+            return;
+        };
+        let Some(ack_nonce) = ack_nonce_opt else {
+            self.send_event(NetworkEvent::StatusUpdate("ACK PoW cancelled".into()));
             self.reset_msg_status(existing_msgid, "msgqueued");
             return;
         };
@@ -1235,25 +1320,34 @@ impl PeerManager {
         pow_payload.extend_from_slice(&encrypted);
 
         let event_tx = self.event_tx.clone();
-        let pow_result = tokio::task::spawn_blocking(move || {
-            // Use recipient's advertised PoW difficulty (at least the default)
-            let target = pow::calculate_target(
-                (pow_payload.len() + 8) as u64,
-                DEFAULT_TTL,
-                rcpt_nonce_trials,
-                rcpt_extra_bytes,
-            );
-            let nonce = pow::do_pow_with_progress(&pow_payload, target, |n| {
-                let _ = event_tx.send(NetworkEvent::StatusUpdate(format!(
-                    "Computing PoW... ({n} attempts)"
-                )));
-            });
-            (nonce, pow_payload)
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let pow_result = tokio::task::spawn_blocking({
+            let cancelled = cancelled.clone();
+            move || {
+                // Use recipient's advertised PoW difficulty (at least the default)
+                let target = pow::calculate_target(
+                    (pow_payload.len() + 8) as u64,
+                    DEFAULT_TTL,
+                    rcpt_nonce_trials,
+                    rcpt_extra_bytes,
+                );
+                let nonce = pow::do_pow_with_progress(&pow_payload, target, |n| {
+                    let _ = event_tx.send(NetworkEvent::StatusUpdate(format!(
+                        "Computing PoW... ({n} attempts)"
+                    )));
+                }, cancelled);
+                (nonce, pow_payload)
+            }
         })
         .await;
 
-        let Ok((nonce, pow_payload)) = pow_result else {
+        let Ok((nonce_opt, pow_payload)) = pow_result else {
             self.send_event(NetworkEvent::Error("PoW computation failed".into()));
+            self.reset_msg_status(existing_msgid, "msgqueued");
+            return;
+        };
+        let Some(nonce) = nonce_opt else {
+            self.send_event(NetworkEvent::StatusUpdate("PoW cancelled".into()));
             self.reset_msg_status(existing_msgid, "msgqueued");
             return;
         };
@@ -1353,21 +1447,29 @@ impl PeerManager {
                 chunk_pow_payload.extend_from_slice(&chunk_encrypted);
 
                 let chunk_event_tx = self.event_tx.clone();
-                let chunk_pow = tokio::task::spawn_blocking(move || {
-                    let target = pow::calculate_target(
-                        (chunk_pow_payload.len() + 8) as u64, DEFAULT_TTL,
-                        rcpt_nonce_trials, rcpt_extra_bytes,
-                    );
-                    let nonce = pow::do_pow_with_progress(&chunk_pow_payload, target, |n| {
-                        let _ = chunk_event_tx.send(NetworkEvent::StatusUpdate(
-                            format!("File chunk PoW... ({n})")
-                        ));
-                    });
-                    (nonce, chunk_pow_payload)
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let chunk_pow = tokio::task::spawn_blocking({
+                    let cancelled = cancelled.clone();
+                    move || {
+                        let target = pow::calculate_target(
+                            (chunk_pow_payload.len() + 8) as u64, DEFAULT_TTL,
+                            rcpt_nonce_trials, rcpt_extra_bytes,
+                        );
+                        let nonce = pow::do_pow_with_progress(&chunk_pow_payload, target, |n| {
+                            let _ = chunk_event_tx.send(NetworkEvent::StatusUpdate(
+                                format!("File chunk PoW... ({n})")
+                            ));
+                        }, cancelled);
+                        (nonce, chunk_pow_payload)
+                    }
                 }).await;
 
-                let Ok((chunk_nonce, chunk_pow_payload)) = chunk_pow else {
+                let Ok((chunk_nonce_opt, chunk_pow_payload)) = chunk_pow else {
                     log::warn!("PoW failed for file chunk {chunk_idx}");
+                    continue;
+                };
+                let Some(chunk_nonce) = chunk_nonce_opt else {
+                    log::warn!("PoW cancelled for file chunk {chunk_idx}");
                     continue;
                 };
 
@@ -1400,8 +1502,16 @@ impl PeerManager {
                 let object_payload = &full_object[pos..];
                 let raw_header_for_signing = &full_object[8..pos];
                 if let Some(ack_data) = self.try_decrypt_message(&header, object_payload, raw_header_for_signing) {
-                    let ack_msg = encode_message("object", &ack_data);
-                    self.broadcast_to_peers(&ack_msg).await;
+                    let ack_inv = InventoryVector::from_object_data(&ack_data);
+                    if !self.sent_acks.contains(&ack_inv.hash) {
+                        if self.sent_acks.len() >= MAX_SENT_ACKS {
+                            let to_keep: HashSet<[u8; 32]> = self.sent_acks.iter().skip(self.sent_acks.len() / 2).copied().collect();
+                            self.sent_acks = to_keep;
+                        }
+                        self.sent_acks.insert(ack_inv.hash);
+                        let ack_msg = encode_message("object", &ack_data);
+                        self.broadcast_to_peers(&ack_msg).await;
+                    }
                 }
             }
         }
@@ -1555,24 +1665,33 @@ impl PeerManager {
         pow_payload.extend_from_slice(&final_payload);
 
         let event_tx = self.event_tx.clone();
-        let pow_result = tokio::task::spawn_blocking(move || {
-            let target = pow::calculate_target(
-                (pow_payload.len() + 8) as u64,
-                DEFAULT_TTL,
-                pow::DEFAULT_NONCE_TRIALS_PER_BYTE,
-                pow::DEFAULT_EXTRA_BYTES,
-            );
-            let nonce = pow::do_pow_with_progress(&pow_payload, target, |n| {
-                let _ = event_tx.send(NetworkEvent::StatusUpdate(format!(
-                    "Computing broadcast PoW... ({n} attempts)"
-                )));
-            });
-            (nonce, pow_payload)
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let pow_result = tokio::task::spawn_blocking({
+            let cancelled = cancelled.clone();
+            move || {
+                let target = pow::calculate_target(
+                    (pow_payload.len() + 8) as u64,
+                    DEFAULT_TTL,
+                    pow::DEFAULT_NONCE_TRIALS_PER_BYTE,
+                    pow::DEFAULT_EXTRA_BYTES,
+                );
+                let nonce = pow::do_pow_with_progress(&pow_payload, target, |n| {
+                    let _ = event_tx.send(NetworkEvent::StatusUpdate(format!(
+                        "Computing broadcast PoW... ({n} attempts)"
+                    )));
+                }, cancelled);
+                (nonce, pow_payload)
+            }
         })
         .await;
 
-        let Ok((nonce, pow_payload)) = pow_result else {
+        let Ok((nonce_opt, pow_payload)) = pow_result else {
             self.send_event(NetworkEvent::Error("Broadcast PoW failed".into()));
+            self.reset_msg_status(existing_msgid, "broadcastqueued");
+            return;
+        };
+        let Some(nonce) = nonce_opt else {
+            self.send_event(NetworkEvent::StatusUpdate("Broadcast PoW cancelled".into()));
             self.reset_msg_status(existing_msgid, "broadcastqueued");
             return;
         };
@@ -1667,6 +1786,13 @@ impl PeerManager {
 
                     let now_ts = unix_time();
                     let mut needed = Vec::new();
+
+                    // Evict half of seen_inv if at capacity to avoid frequent evictions
+                    if self.seen_inv.len() >= MAX_SEEN_INV {
+                        let to_keep: HashSet<[u8; 32]> = self.seen_inv.iter().skip(self.seen_inv.len() / 2).copied().collect();
+                        self.seen_inv = to_keep;
+                    }
+
                     for hash in &to_check {
                         if existing.contains(hash) {
                             self.seen_inv.insert(*hash);
@@ -1674,6 +1800,12 @@ impl PeerManager {
                         }
                         needed.push(InventoryVector::new(*hash));
                         self.seen_inv.insert(*hash);
+
+                        // Evict oldest missing_objects entries if at capacity
+                        if self.missing_objects.len() >= MAX_MISSING_OBJECTS {
+                            let cutoff = self.missing_objects.values().map(|v| v.requested_at).min().unwrap_or(0) + 60;
+                            self.missing_objects.retain(|_, v| v.requested_at > cutoff);
+                        }
                         self.missing_objects.insert(*hash, MissingObject {
                             requested_at: now_ts,
                             from_peer: from_addr.to_string(),
@@ -1713,6 +1845,7 @@ impl PeerManager {
                 log::info!("Received object ({} bytes) from {}", payload.len(), from_addr);
                 let inv_hash = InventoryVector::from_object_data(payload);
                 self.missing_objects.remove(&inv_hash.hash);
+                self.update_peer_score(from_addr, true);
                 self.handle_object(payload).await;
             }
             "addr" => {
@@ -1822,11 +1955,18 @@ impl PeerManager {
         match header.object_type {
             object_type::MSG => {
                 if let Some(ack_data) = self.try_decrypt_message(&header, object_payload, raw_header_for_signing) {
-                    // Broadcast the ACK object to confirm delivery
-                    let ack_msg = encode_message("object", &ack_data);
-                    self.broadcast_to_peers(&ack_msg).await;
-                    // Also store ACK in our inventory
+                    // Broadcast the ACK object to confirm delivery (with deduplication)
                     let ack_hash = InventoryVector::from_object_data(&ack_data);
+                    if !self.sent_acks.contains(&ack_hash.hash) {
+                        if self.sent_acks.len() >= MAX_SENT_ACKS {
+                            let to_keep: HashSet<[u8; 32]> = self.sent_acks.iter().skip(self.sent_acks.len() / 2).copied().collect();
+                            self.sent_acks = to_keep;
+                        }
+                        self.sent_acks.insert(ack_hash.hash);
+                        let ack_msg = encode_message("object", &ack_data);
+                        self.broadcast_to_peers(&ack_msg).await;
+                    }
+                    // Also store ACK in our inventory
                     if let Ok(db) = self.db.lock() {
                         let _ = db.store_inventory(
                             &ack_hash.hash, object_type::MSG, header.stream_number,
@@ -2128,20 +2268,25 @@ impl PeerManager {
             pow_payload.extend_from_slice(&pubkey_payload);
 
             let event_tx = self.event_tx.clone();
-            let pow_result = tokio::task::spawn_blocking(move || {
-                let target = pow::calculate_target(
-                    (pow_payload.len() + 8) as u64, DEFAULT_TTL,
-                    pow::DEFAULT_NONCE_TRIALS_PER_BYTE, pow::DEFAULT_EXTRA_BYTES,
-                );
-                let nonce = pow::do_pow_with_progress(&pow_payload, target, |n| {
-                    let _ = event_tx.send(NetworkEvent::StatusUpdate(
-                        format!("Computing pubkey PoW... ({n})")
-                    ));
-                });
-                (nonce, pow_payload)
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let pow_result = tokio::task::spawn_blocking({
+                let cancelled = cancelled.clone();
+                move || {
+                    let target = pow::calculate_target(
+                        (pow_payload.len() + 8) as u64, DEFAULT_TTL,
+                        pow::DEFAULT_NONCE_TRIALS_PER_BYTE, pow::DEFAULT_EXTRA_BYTES,
+                    );
+                    let nonce = pow::do_pow_with_progress(&pow_payload, target, |n| {
+                        let _ = event_tx.send(NetworkEvent::StatusUpdate(
+                            format!("Computing pubkey PoW... ({n})")
+                        ));
+                    }, cancelled);
+                    (nonce, pow_payload)
+                }
             }).await;
 
-            let Ok((nonce, pow_payload)) = pow_result else { return; };
+            let Ok((nonce_opt, pow_payload)) = pow_result else { return; };
+            let Some(nonce) = nonce_opt else { return; };
             let mut full_object = nonce.to_be_bytes().to_vec();
             full_object.extend_from_slice(&pow_payload);
 
@@ -2197,20 +2342,25 @@ impl PeerManager {
             pow_payload.extend_from_slice(&pubkey_payload);
 
             let event_tx = self.event_tx.clone();
-            let pow_result = tokio::task::spawn_blocking(move || {
-                let target = pow::calculate_target(
-                    (pow_payload.len() + 8) as u64, DEFAULT_TTL,
-                    pow::DEFAULT_NONCE_TRIALS_PER_BYTE, pow::DEFAULT_EXTRA_BYTES,
-                );
-                let nonce = pow::do_pow_with_progress(&pow_payload, target, |n| {
-                    let _ = event_tx.send(NetworkEvent::StatusUpdate(
-                        format!("Computing v4 pubkey PoW... ({n})")
-                    ));
-                });
-                (nonce, pow_payload)
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let pow_result = tokio::task::spawn_blocking({
+                let cancelled = cancelled.clone();
+                move || {
+                    let target = pow::calculate_target(
+                        (pow_payload.len() + 8) as u64, DEFAULT_TTL,
+                        pow::DEFAULT_NONCE_TRIALS_PER_BYTE, pow::DEFAULT_EXTRA_BYTES,
+                    );
+                    let nonce = pow::do_pow_with_progress(&pow_payload, target, |n| {
+                        let _ = event_tx.send(NetworkEvent::StatusUpdate(
+                            format!("Computing v4 pubkey PoW... ({n})")
+                        ));
+                    }, cancelled);
+                    (nonce, pow_payload)
+                }
             }).await;
 
-            let Ok((nonce, pow_payload)) = pow_result else { return; };
+            let Ok((nonce_opt, pow_payload)) = pow_result else { return; };
+            let Some(nonce) = nonce_opt else { return; };
             let mut full_object = nonce.to_be_bytes().to_vec();
             full_object.extend_from_slice(&pow_payload);
 
