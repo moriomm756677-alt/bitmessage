@@ -1,0 +1,11 @@
+pub mod app;
+pub mod theme;
+pub mod tray;
+pub mod bbcode;
+mod inbox;
+mod compose;
+mod contacts;
+mod channels;
+mod identities;
+mod blacklist;
+mod settings;

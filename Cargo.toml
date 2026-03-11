@@ -1,0 +1,64 @@
+[package]
+name = "bitmessage-rs"
+version = "0.5.0"
+edition = "2021"
+description = "Bitmessage client in Rust with egui GUI"
+
+[dependencies]
+# GUI
+eframe = { version = "0.29", default-features = false, features = [
+    "default_fonts",
+    "glow",
+] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Crypto
+k256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
+sha1 = "0.10"
+sha2 = "0.10"
+ripemd = "0.1"
+aes = "0.8"
+cbc = "0.1"
+cipher = { version = "0.4", features = ["alloc"] }
+hmac = "0.12"
+digest = "0.10"
+rand = "0.8"
+bs58 = "0.5"
+hex = "0.4"
+
+# Storage
+rusqlite = { version = "0.38", features = ["bundled"] }
+
+# Async / Network
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "macros",
+] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+
+# Time
+chrono = { version = "0.4", features = ["clock"] }
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# System tray
+tray-icon = "0.21"
+
+# File dialog
+rfd = "0.15"
+
+# Tor
+arti-client = { version = "0.40", features = ["tokio", "native-tls"] }
+tor-rtcompat = { version = "0.40", features = ["tokio"] }
