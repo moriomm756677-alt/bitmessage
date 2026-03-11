@@ -134,11 +134,19 @@ pub fn render_settings(app: &mut BitmessageApp, ui: &mut egui::Ui) {
             // Security
             settings_section(ui, &theme::icon_text(icon::LOCK, "Security"), |ui| {
                 if app.keys_encrypted {
-                    ui.label(
-                        RichText::new("Private keys are encrypted")
-                            .color(theme::SUCCESS)
-                            .size(13.0),
-                    );
+                    if app.session_key.is_some() {
+                        ui.label(
+                            RichText::new("Private keys are encrypted and unlocked")
+                                .color(theme::SUCCESS)
+                                .size(13.0),
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new("Private keys are encrypted (locked)")
+                                .color(theme::WARNING)
+                                .size(13.0),
+                        );
+                    }
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Password:").color(theme::TEXT_DIM).size(13.0));
@@ -147,31 +155,83 @@ pub fn render_settings(app: &mut BitmessageApp, ui: &mut egui::Ui) {
                             .hint_text("Enter password")
                             .desired_width(200.0));
                     });
-                    if ui.add(theme::subtle_button("Remove Encryption")).clicked() {
-                        if !app.password_input.is_empty() {
-                            let key = crate::storage::derive_key_from_password(&app.password_input);
-                            if let Ok(db) = app.db.lock() {
-                                match db.decrypt_private_keys(&key) {
-                                    Ok(()) => {
-                                        let _ = db.set_setting("keys_encrypted", "0");
-                                        app.keys_encrypted = false;
+                    ui.horizontal(|ui| {
+                        // Unlock button (if not yet unlocked)
+                        if app.session_key.is_none() {
+                            if ui.add(theme::accent_button("Unlock")).clicked() {
+                                if !app.password_input.is_empty() {
+                                    let key = crate::storage::derive_key_from_password(&app.password_input);
+                                    // Verify password by trying to decrypt first identity's raw key
+                                    let valid = if let Ok(db) = app.db.lock() {
+                                        // Read raw keys (no session key set yet, so no auto-decrypt)
+                                        let raw_ok = db.get_identities().ok();
+                                        if let Some(ids) = &raw_ok {
+                                            if let Some(id) = ids.first() {
+                                                if id.signing_key.len() > 32 {
+                                                    crate::storage::simple_decrypt_pub(&key, &id.signing_key).is_ok()
+                                                } else {
+                                                    true
+                                                }
+                                            } else {
+                                                true
+                                            }
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    };
+                                    if valid {
+                                        app.session_key = Some(key);
+                                        if let Ok(mut db) = app.db.lock() {
+                                            db.set_session_key(Some(key));
+                                        }
                                         app.notifications.push((
-                                            format!("{} Encryption removed", icon::CHECK),
+                                            format!("{} Keys unlocked", icon::CHECK),
+                                            std::time::Instant::now(),
+                                        ));
+                                        app.refresh_data();
+                                    } else {
+                                        app.notifications.push((
+                                            format!("{} Wrong password", icon::DELETE),
                                             std::time::Instant::now(),
                                         ));
                                     }
-                                    Err(e) => {
-                                        app.notifications.push((
-                                            format!("{} Wrong password: {e}", icon::DELETE),
-                                            std::time::Instant::now(),
-                                        ));
-                                    }
+                                    app.password_input.clear();
                                 }
                             }
-                            app.password_input.clear();
-                            app.refresh_data();
                         }
-                    }
+                        // Remove encryption
+                        if ui.add(theme::subtle_button("Remove Encryption")).clicked() {
+                            if !app.password_input.is_empty() {
+                                let key = crate::storage::derive_key_from_password(&app.password_input);
+                                if let Ok(mut db) = app.db.lock() {
+                                    // Temporarily set session key so decrypt_private_keys can read raw keys
+                                    db.set_session_key(None);
+                                    match db.decrypt_private_keys(&key) {
+                                        Ok(()) => {
+                                            let _ = db.set_setting("keys_encrypted", "0");
+                                            db.set_session_key(None);
+                                            app.keys_encrypted = false;
+                                            app.session_key = None;
+                                            app.notifications.push((
+                                                format!("{} Encryption removed", icon::CHECK),
+                                                std::time::Instant::now(),
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            app.notifications.push((
+                                                format!("{} Wrong password: {e}", icon::DELETE),
+                                                std::time::Instant::now(),
+                                            ));
+                                        }
+                                    }
+                                }
+                                app.password_input.clear();
+                                app.refresh_data();
+                            }
+                        }
+                    });
                 } else {
                     ui.label(
                         RichText::new("Private keys are NOT encrypted")
@@ -189,10 +249,12 @@ pub fn render_settings(app: &mut BitmessageApp, ui: &mut egui::Ui) {
                     if ui.add(theme::accent_button("Encrypt Keys")).clicked() {
                         if !app.password_input.is_empty() {
                             let key = crate::storage::derive_key_from_password(&app.password_input);
-                            if let Ok(db) = app.db.lock() {
+                            if let Ok(mut db) = app.db.lock() {
                                 match db.encrypt_private_keys(&key) {
                                     Ok(()) => {
                                         app.keys_encrypted = true;
+                                        app.session_key = Some(key);
+                                        db.set_session_key(Some(key));
                                         app.notifications.push((
                                             format!("{} Keys encrypted", icon::CHECK),
                                             std::time::Instant::now(),

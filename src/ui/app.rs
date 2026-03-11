@@ -144,6 +144,11 @@ pub struct BitmessageApp {
     pub password_input: String,
     pub show_password_dialog: bool,
     pub keys_encrypted: bool,
+    /// True when app needs password before showing main UI
+    pub needs_unlock: bool,
+    pub unlock_error: String,
+    /// Stored password hash for decrypting keys in memory during the session
+    pub session_key: Option<[u8; 32]>,
 }
 
 impl BitmessageApp {
@@ -215,6 +220,9 @@ impl BitmessageApp {
             password_input: String::new(),
             show_password_dialog: false,
             keys_encrypted: false,
+            needs_unlock: false,
+            unlock_error: String::new(),
+            session_key: None,
         };
         app.refresh_data();
         // Load persisted settings from DB
@@ -224,6 +232,7 @@ impl BitmessageApp {
             app.setting_extra_bytes = db.get_setting("extra_bytes").unwrap_or_else(|| "1000".into());
             app.setting_default_ttl_days = db.get_setting("default_ttl_days").unwrap_or_else(|| "4".into());
             app.keys_encrypted = db.are_keys_encrypted();
+            app.needs_unlock = app.keys_encrypted;
         }
         app
     }
@@ -578,6 +587,112 @@ impl eframe::App for BitmessageApp {
         }
 
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
+
+        // Unlock screen — shown before main UI when keys are encrypted
+        if self.needs_unlock {
+            egui::CentralPanel::default()
+                .frame(egui::Frame {
+                    fill: theme::BG_DARK,
+                    inner_margin: egui::Margin::same(0.0),
+                    ..Default::default()
+                })
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(ui.available_height() / 3.0);
+
+                        // Logo
+                        if let Some(tex) = &self.logo_texture {
+                            let size = egui::vec2(48.0, 48.0);
+                            ui.image(egui::load::SizedTexture::new(tex.id(), size));
+                        }
+                        ui.add_space(12.0);
+                        ui.label(
+                            RichText::new("Bitmessage")
+                                .size(24.0)
+                                .strong()
+                                .color(theme::ACCENT),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new("Private keys are encrypted")
+                                .size(14.0)
+                                .color(theme::TEXT_SECONDARY),
+                        );
+                        ui.add_space(24.0);
+
+                        // Password field
+                        ui.label(
+                            RichText::new("Enter password to unlock:")
+                                .size(13.0)
+                                .color(theme::TEXT_DIM),
+                        );
+                        ui.add_space(8.0);
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut self.password_input)
+                                .password(true)
+                                .hint_text("Password")
+                                .desired_width(280.0),
+                        );
+
+                        // Submit on Enter
+                        let enter_pressed = response.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+                        ui.add_space(12.0);
+
+                        let unlock_clicked = ui.add(
+                            theme::accent_button("Unlock")
+                                .min_size(egui::vec2(280.0, 36.0)),
+                        ).clicked();
+
+                        if (unlock_clicked || enter_pressed) && !self.password_input.is_empty() {
+                            let key = crate::storage::derive_key_from_password(&self.password_input);
+                            // Verify password
+                            let valid = if let Ok(db) = self.db.lock() {
+                                if let Ok(ids) = db.get_identities() {
+                                    if let Some(id) = ids.first() {
+                                        if id.signing_key.len() > 32 {
+                                            crate::storage::simple_decrypt_pub(&key, &id.signing_key).is_ok()
+                                        } else {
+                                            true
+                                        }
+                                    } else {
+                                        true
+                                    }
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+
+                            if valid {
+                                self.session_key = Some(key);
+                                if let Ok(mut db) = self.db.lock() {
+                                    db.set_session_key(Some(key));
+                                }
+                                self.needs_unlock = false;
+                                self.unlock_error.clear();
+                                self.refresh_data();
+                            } else {
+                                self.unlock_error = "Wrong password".into();
+                            }
+                            self.password_input.clear();
+                        }
+
+                        // Error message
+                        if !self.unlock_error.is_empty() {
+                            ui.add_space(12.0);
+                            ui.label(
+                                RichText::new(&self.unlock_error)
+                                    .size(13.0)
+                                    .color(theme::ERROR),
+                            );
+                        }
+                    });
+                });
+            return;
+        }
 
         // Sidebar
         egui::SidePanel::left("nav_panel")

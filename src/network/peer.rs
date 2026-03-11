@@ -1091,10 +1091,15 @@ impl PeerManager {
             return;
         };
 
+        log::info!("Sender signing_key len={}, encryption_key len={} for {}",
+            sender.signing_key.len(), sender.encryption_key.len(), from);
         let Ok(sender_keypair) =
             KeyPair::from_secrets(sender.signing_key.clone(), sender.encryption_key.clone())
         else {
-            self.send_event(NetworkEvent::Error("Invalid sender keys".into()));
+            self.send_event(NetworkEvent::Error(format!(
+                "Invalid sender keys (sign={} bytes, enc={} bytes) — keys may be encrypted, unlock in Settings",
+                sender.signing_key.len(), sender.encryption_key.len()
+            )));
             self.reset_msg_status(existing_msgid, "msgqueued");
             return;
         };

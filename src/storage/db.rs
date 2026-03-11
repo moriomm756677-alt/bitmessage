@@ -131,6 +131,8 @@ pub struct ExportedIdentity {
 
 pub struct Database {
     conn: Connection,
+    /// Session key for decrypting private keys in memory
+    session_key: Option<[u8; 32]>,
 }
 
 impl Database {
@@ -145,7 +147,7 @@ impl Database {
             PRAGMA synchronous=NORMAL;
             PRAGMA busy_timeout=5000;
         ")?;
-        let db = Self { conn };
+        let db = Self { conn, session_key: None };
         db.init_tables()?;
         Ok(db)
     }
@@ -460,7 +462,13 @@ impl Database {
                 created_at: row.get(12)?,
             })
         })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        let mut identities: Vec<StoredIdentity> = rows.filter_map(|r| r.ok()).collect();
+        // Auto-decrypt private keys in memory if session key is available
+        for id in &mut identities {
+            id.signing_key = self.decrypt_key_if_needed(&id.signing_key);
+            id.encryption_key = self.decrypt_key_if_needed(&id.encryption_key);
+        }
+        Ok(identities)
     }
 
     pub fn delete_identity(&self, id: i64) -> Result<(), DbError> {
@@ -677,7 +685,13 @@ impl Database {
                 created_at: row.get(12)?,
             })
         })?;
-        Ok(rows.next().and_then(|r| r.ok()))
+        let mut identity = rows.next().and_then(|r| r.ok());
+        // Auto-decrypt private keys in memory
+        if let Some(ref mut id) = identity {
+            id.signing_key = self.decrypt_key_if_needed(&id.signing_key);
+            id.encryption_key = self.decrypt_key_if_needed(&id.encryption_key);
+        }
+        Ok(identity)
     }
 
     pub fn get_pubkey_for_address(&self, address: &str) -> Result<Option<(Vec<u8>, Vec<u8>)>, DbError> {
@@ -1419,6 +1433,28 @@ impl Database {
     pub fn are_keys_encrypted(&self) -> bool {
         self.get_setting("keys_encrypted").map(|v| v == "1").unwrap_or(false)
     }
+
+    /// Set session key for in-memory decryption of private keys
+    pub fn set_session_key(&mut self, key: Option<[u8; 32]>) {
+        self.session_key = key;
+    }
+
+    /// Get current session key
+    pub fn session_key(&self) -> Option<&[u8; 32]> {
+        self.session_key.as_ref()
+    }
+
+    /// Decrypt private key bytes in memory if session key is set and key is encrypted
+    fn decrypt_key_if_needed(&self, key_bytes: &[u8]) -> Vec<u8> {
+        if key_bytes.len() > 32 {
+            if let Some(ref sk) = self.session_key {
+                if let Ok(dec) = simple_decrypt(sk, key_bytes) {
+                    return dec;
+                }
+            }
+        }
+        key_bytes.to_vec()
+    }
 }
 
 /// Simple AES-256-CBC encryption with random IV
@@ -1439,6 +1475,11 @@ fn simple_encrypt(key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
 }
 
 /// Simple AES-256-CBC decryption
+/// Public wrapper for in-memory key decryption
+pub fn simple_decrypt_pub(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, &'static str> {
+    simple_decrypt(key, data)
+}
+
 fn simple_decrypt(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, &'static str> {
     use aes::cipher::{BlockDecryptMut, KeyIvInit};
     use cipher::block_padding::Pkcs7;
