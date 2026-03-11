@@ -1,6 +1,6 @@
 # Bitmessage-RS
 
-A decentralized, encrypted messaging client implementing the [Bitmessage protocol](https://wiki.bitmessage.org/) in Rust. All connections are routed through **Tor** (via [arti](https://gitlab.torproject.org/tpo/core/arti)).
+A decentralized, encrypted messaging client implementing the [Bitmessage protocol](https://wiki.bitmessage.org/) in Rust. Fully compatible with [PyBitmessage](https://github.com/Bitmessage/PyBitmessage). All connections are routed through **Tor** (via [arti](https://gitlab.torproject.org/tpo/core/arti)).
 
 Built with **Rust** + **egui** for the GUI.
 
