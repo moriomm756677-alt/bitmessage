@@ -136,13 +136,13 @@ pub fn render_settings(app: &mut BitmessageApp, ui: &mut egui::Ui) {
                 if app.keys_encrypted {
                     if app.session_key.is_some() {
                         ui.label(
-                            RichText::new("Private keys are encrypted and unlocked")
+                            RichText::new("Keys and messages are encrypted and unlocked")
                                 .color(theme::SUCCESS)
                                 .size(13.0),
                         );
                     } else {
                         ui.label(
-                            RichText::new("Private keys are encrypted (locked)")
+                            RichText::new("Keys and messages are encrypted (locked)")
                                 .color(theme::WARNING)
                                 .size(13.0),
                         );
@@ -206,20 +206,23 @@ pub fn render_settings(app: &mut BitmessageApp, ui: &mut egui::Ui) {
                             if !app.password_input.is_empty() {
                                 let key = crate::storage::derive_key_from_password(&app.password_input);
                                 if let Ok(mut db) = app.db.lock() {
-                                    // Temporarily set session key so decrypt_private_keys can read raw keys
-                                    db.set_session_key(None);
+                                    // Set session key for decryption
+                                    db.set_session_key(Some(key));
                                     match db.decrypt_private_keys(&key) {
                                         Ok(()) => {
+                                            // Also decrypt all messages
+                                            let msg_count = db.decrypt_all_messages().unwrap_or(0);
                                             let _ = db.set_setting("keys_encrypted", "0");
                                             db.set_session_key(None);
                                             app.keys_encrypted = false;
                                             app.session_key = None;
                                             app.notifications.push((
-                                                format!("{} Encryption removed", icon::CHECK),
+                                                format!("{} Encryption removed ({msg_count} messages decrypted)", icon::CHECK),
                                                 std::time::Instant::now(),
                                             ));
                                         }
                                         Err(e) => {
+                                            db.set_session_key(None);
                                             app.notifications.push((
                                                 format!("{} Wrong password: {e}", icon::DELETE),
                                                 std::time::Instant::now(),
@@ -234,7 +237,7 @@ pub fn render_settings(app: &mut BitmessageApp, ui: &mut egui::Ui) {
                     });
                 } else {
                     ui.label(
-                        RichText::new("Private keys are NOT encrypted")
+                        RichText::new("Database is NOT encrypted (keys and messages in plaintext)")
                             .color(theme::WARNING)
                             .size(13.0),
                     );
@@ -246,7 +249,7 @@ pub fn render_settings(app: &mut BitmessageApp, ui: &mut egui::Ui) {
                             .hint_text("Enter password")
                             .desired_width(200.0));
                     });
-                    if ui.add(theme::accent_button("Encrypt Keys")).clicked() {
+                    if ui.add(theme::accent_button("Encrypt Database")).clicked() {
                         if !app.password_input.is_empty() {
                             let key = crate::storage::derive_key_from_password(&app.password_input);
                             if let Ok(mut db) = app.db.lock() {
@@ -255,8 +258,10 @@ pub fn render_settings(app: &mut BitmessageApp, ui: &mut egui::Ui) {
                                         app.keys_encrypted = true;
                                         app.session_key = Some(key);
                                         db.set_session_key(Some(key));
+                                        // Also encrypt existing messages
+                                        let msg_count = db.encrypt_existing_messages().unwrap_or(0);
                                         app.notifications.push((
-                                            format!("{} Keys encrypted", icon::CHECK),
+                                            format!("{} Database encrypted ({msg_count} messages)", icon::CHECK),
                                             std::time::Instant::now(),
                                         ));
                                     }
@@ -269,6 +274,7 @@ pub fn render_settings(app: &mut BitmessageApp, ui: &mut egui::Ui) {
                                 }
                             }
                             app.password_input.clear();
+                            app.refresh_data();
                         }
                     }
                 }

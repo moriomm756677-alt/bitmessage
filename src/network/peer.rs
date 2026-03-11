@@ -25,6 +25,7 @@ const MAX_PEERS: usize = 8;
 const RETRY_QUEUED_INTERVAL: Duration = Duration::from_secs(60);
 const STATS_INTERVAL: Duration = Duration::from_secs(5);
 const DOWNLOAD_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+const REPROCESS_RELOAD_INTERVAL: Duration = Duration::from_secs(120); // 2 min
 const REQUEST_TIMEOUT_SECS: u64 = 60;
 const MAX_SEEN_INV: usize = 500_000;
 const MAX_MISSING_OBJECTS: usize = 50_000;
@@ -76,9 +77,10 @@ pub struct PeerManager {
     pub objects_processed: u64,
     pub bytes_sent: u64,
     pub bytes_received: u64,
-    // Pending reprocess queue (loaded once, drained in batches)
+    // Pending reprocess queue (periodically reloaded for unprocessed objects)
     reprocess_queue: Vec<(Vec<u8>, Vec<u8>)>, // (hash, payload)
     reprocess_decrypted: u32,
+    last_reprocess_reload: tokio::time::Instant,
     // Track sent ACK hashes to prevent broadcasting duplicate ACKs
     sent_acks: HashSet<[u8; 32]>,
     // Consecutive connection failures for exponential backoff
@@ -139,6 +141,7 @@ impl PeerManager {
             bytes_received: 0,
             reprocess_queue: Vec::new(),
             reprocess_decrypted: 0,
+            last_reprocess_reload: now,
             sent_acks: HashSet::new(),
             consecutive_failures: 0,
             peer_scores: HashMap::new(),
@@ -315,6 +318,14 @@ impl PeerManager {
                     if now.duration_since(self.last_download_retry) > DOWNLOAD_RETRY_INTERVAL {
                         self.last_download_retry = now;
                         self.retry_downloads().await;
+                    }
+
+                    // Periodically reload reprocess queue for any unprocessed objects
+                    if self.reprocess_queue.is_empty()
+                        && now.duration_since(self.last_reprocess_reload) > REPROCESS_RELOAD_INTERVAL
+                    {
+                        self.last_reprocess_reload = now;
+                        self.load_reprocess_queue();
                     }
                 }
             }
@@ -1916,11 +1927,12 @@ impl PeerManager {
             // Don't reject - some objects may have different PoW requirements
         }
 
-        // Store in inventory (dedup)
+        // Store in inventory and check state (dedup + processed check)
         let inv_hash = InventoryVector::from_object_data(data);
-        let is_new = if let Ok(db) = self.db.lock() {
+        let (is_new, already_processed) = if let Ok(db) = self.db.lock() {
             if db.has_inventory(&inv_hash.hash) {
-                false
+                // Already in inventory — check if it was processed
+                (false, db.is_inventory_processed(&inv_hash.hash))
             } else {
                 let _ = db.store_inventory(
                     &inv_hash.hash,
@@ -1936,19 +1948,23 @@ impl PeerManager {
                         "Message delivery confirmed (ACK received)".into(),
                     ));
                 }
-                true
+                (true, false)
             }
         } else {
-            false
+            // DB lock failed — still try to process (don't skip)
+            (false, false)
         };
 
-        if !is_new {
-            return; // Already processed
+        // Relay to peers only if new
+        if is_new {
+            let object_msg = encode_message("object", data);
+            self.broadcast_to_peers(&object_msg).await;
         }
 
-        // Re-broadcast to peers (relay)
-        let object_msg = encode_message("object", data);
-        self.broadcast_to_peers(&object_msg).await;
+        // Skip only if already successfully processed
+        if already_processed {
+            return;
+        }
 
         self.objects_processed += 1;
 
@@ -1956,6 +1972,9 @@ impl PeerManager {
         let object_payload = &data[pos..];
         // Raw header bytes for signing: skip 8-byte nonce, keep everything up to payload
         let raw_header_for_signing = &data[8..pos];
+
+        log::debug!("Processing object type={} version={} stream={} ({} bytes payload)",
+            header.object_type, header.version, header.stream_number, object_payload.len());
 
         match header.object_type {
             object_type::MSG => {
@@ -1984,6 +2003,7 @@ impl PeerManager {
                 self.handle_pubkey_object(&header, object_payload, raw_header_for_signing);
             }
             object_type::BROADCAST => {
+                log::info!("Processing broadcast object (version={}, {} bytes)", header.version, object_payload.len());
                 self.try_decrypt_broadcast(&header, object_payload, raw_header_for_signing);
             }
             object_type::GETPUBKEY => {
@@ -1996,7 +2016,7 @@ impl PeerManager {
             }
         }
 
-        // Mark as processed so reprocess_inventory won't retry it
+        // Mark as processed so reprocess won't retry it
         if let Ok(db) = self.db.lock() {
             let _ = db.mark_object_processed(&inv_hash.hash);
         }
@@ -2638,20 +2658,26 @@ impl PeerManager {
 
     /// Try to decrypt a broadcast using subscriptions and channels
     fn try_decrypt_broadcast(&self, header: &ObjectHeader, data: &[u8], raw_header_for_signing: &[u8]) {
+        log::info!("try_decrypt_broadcast: version={}, data_len={}", header.version, data.len());
+
         if header.version == 5 {
             // V5 broadcast: tag (32 bytes) + encrypted data
             if data.len() < 32 {
+                log::warn!("Broadcast v5 too short: {} bytes", data.len());
                 return;
             }
             let tag = &data[..32];
             let encrypted = &data[32..];
+            log::debug!("Broadcast v5: tag={}, encrypted_len={}", hex::encode(&tag[..8]), encrypted.len());
 
             // Check subscriptions
             let subscriptions = if let Ok(db) = self.db.lock() {
                 db.get_subscriptions().unwrap_or_default()
             } else {
+                log::warn!("try_decrypt_broadcast: failed to lock DB for subscriptions");
                 return;
             };
+            log::debug!("Checking {} subscriptions for broadcast", subscriptions.len());
 
             for sub in &subscriptions {
                 if !sub.enabled {
@@ -2687,14 +2713,17 @@ impl PeerManager {
             let channels = if let Ok(db) = self.db.lock() {
                 db.get_channels().unwrap_or_default()
             } else {
+                log::warn!("try_decrypt_broadcast: failed to lock DB for channels");
                 return;
             };
+            log::debug!("Checking {} channels for broadcast", channels.len());
 
             for channel in &channels {
                 if !channel.enabled {
                     continue;
                 }
                 let Ok(addr) = BitmessageAddress::decode(&channel.address) else {
+                    log::debug!("Channel address decode failed: {}", channel.address);
                     continue;
                 };
 
@@ -2707,8 +2736,10 @@ impl PeerManager {
                 if tag != expected_tag.as_slice() {
                     continue;
                 }
+                log::info!("Broadcast tag matches channel: {}", channel.address);
 
                 let Ok(secret_key) = k256::SecretKey::from_slice(&enc_key_bytes) else {
+                    log::warn!("Failed to create secret key for channel: {}", channel.address);
                     continue;
                 };
 
@@ -2719,6 +2750,7 @@ impl PeerManager {
                 self.process_decrypted_broadcast(header, &decrypted, &channel.address, raw_header_for_signing, Some(tag));
                 return;
             }
+            log::debug!("No subscription/channel matched broadcast v5 tag");
         } else if header.version == 4 {
             // V4 broadcast: encrypted (v3 address), no tag — try all subscriptions + channels
             let subscriptions = if let Ok(db) = self.db.lock() {
@@ -2755,6 +2787,9 @@ impl PeerManager {
                     return;
                 }
             }
+            log::debug!("No subscription/channel matched broadcast v4");
+        } else {
+            log::warn!("Unknown broadcast version: {}", header.version);
         }
     }
 
@@ -2816,6 +2851,8 @@ impl PeerManager {
         } else {
             subscription_address.to_string()
         };
+
+        log::info!("Broadcast decrypted from {sender_address}: {subject}");
 
         if let Ok(db) = self.db.lock() {
             let bc_hash = <sha2::Sha256 as sha2::Digest>::digest(decrypted);

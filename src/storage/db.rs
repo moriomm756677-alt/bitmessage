@@ -535,11 +535,13 @@ impl Database {
         folder: &str,
     ) -> Result<i64, DbError> {
         let now = chrono::Utc::now().timestamp();
+        let enc_subject = self.encrypt_text_if_needed(subject);
+        let enc_body = self.encrypt_text_if_needed(body);
         self.conn.execute(
             "INSERT OR IGNORE INTO messages (msgid, from_address, to_address, subject, body,
              encoding, status, folder, read, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9)",
-            params![msgid, from, to, subject, body, encoding, status, folder, now],
+            params![msgid, from, to, enc_subject, enc_body, encoding, status, folder, now],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -569,7 +571,13 @@ impl Database {
                 created_at: row.get(10)?,
             })
         })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        let mut messages: Vec<StoredMessage> = rows.filter_map(|r| r.ok()).collect();
+        // Decrypt encrypted message fields
+        for msg in &mut messages {
+            msg.subject = self.decrypt_text_if_needed(&msg.subject);
+            msg.body = self.decrypt_text_if_needed(&msg.body);
+        }
+        Ok(messages)
     }
 
     pub fn count_messages_by_folder(&self, folder: &str) -> Result<i64, DbError> {
@@ -602,11 +610,16 @@ impl Database {
                 created_at: row.get(10)?,
             })
         })?;
-        Ok(rows.next().and_then(|r| r.ok()))
+        let mut msg = rows.next().and_then(|r| r.ok());
+        if let Some(ref mut m) = msg {
+            m.subject = self.decrypt_text_if_needed(&m.subject);
+            m.body = self.decrypt_text_if_needed(&m.body);
+        }
+        Ok(msg)
     }
 
     pub fn get_message_by_msgid(&self, msgid: &str) -> Option<StoredMessage> {
-        self.conn.query_row(
+        let mut msg = self.conn.query_row(
             "SELECT id, msgid, from_address, to_address, subject, body,
              encoding, status, folder, read, created_at
              FROM messages WHERE msgid = ?1",
@@ -626,7 +639,12 @@ impl Database {
                     created_at: row.get(10)?,
                 })
             },
-        ).ok()
+        ).ok();
+        if let Some(ref mut m) = msg {
+            m.subject = self.decrypt_text_if_needed(&m.subject);
+            m.body = self.decrypt_text_if_needed(&m.body);
+        }
+        msg
     }
 
     pub fn mark_message_read(&self, id: i64) -> Result<(), DbError> {
@@ -922,6 +940,15 @@ impl Database {
         Ok(())
     }
 
+    /// Check if an inventory object has been processed
+    pub fn is_inventory_processed(&self, hash: &[u8]) -> bool {
+        self.conn.query_row(
+            "SELECT processed FROM inventory WHERE hash = ?1",
+            params![hash],
+            |row| row.get::<_, i64>(0),
+        ).map(|p| p != 0).unwrap_or(false)
+    }
+
     /// Mark all inventory objects of a given type as processed
     pub fn mark_inventory_processed(&self, obj_type: u32) -> Result<(), DbError> {
         self.conn.execute(
@@ -1091,7 +1118,12 @@ impl Database {
                 created_at: row.get(10)?,
             })
         })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        let mut messages: Vec<StoredMessage> = rows.filter_map(|r| r.ok()).collect();
+        for msg in &mut messages {
+            msg.subject = self.decrypt_text_if_needed(&msg.subject);
+            msg.body = self.decrypt_text_if_needed(&msg.body);
+        }
+        Ok(messages)
     }
 
     // --- Settings ---
@@ -1454,6 +1486,95 @@ impl Database {
             }
         }
         key_bytes.to_vec()
+    }
+
+    /// Encrypt text field if session key is set. Returns "ENC:" + hex(encrypted) or plaintext.
+    fn encrypt_text_if_needed(&self, text: &str) -> String {
+        if let Some(ref sk) = self.session_key {
+            let encrypted = simple_encrypt(sk, text.as_bytes());
+            format!("ENC:{}", hex::encode(&encrypted))
+        } else {
+            text.to_string()
+        }
+    }
+
+    /// Decrypt text field if it starts with "ENC:" prefix. Falls back to plaintext.
+    fn decrypt_text_if_needed(&self, text: &str) -> String {
+        if let Some(stripped) = text.strip_prefix("ENC:") {
+            if let Some(ref sk) = self.session_key {
+                if let Ok(bytes) = hex::decode(stripped) {
+                    if let Ok(dec) = simple_decrypt(sk, &bytes) {
+                        if let Ok(s) = String::from_utf8(dec) {
+                            return s;
+                        }
+                    }
+                }
+            }
+            // Can't decrypt — return placeholder
+            "[Encrypted]".to_string()
+        } else {
+            text.to_string()
+        }
+    }
+
+    /// Re-encrypt all plaintext messages with session key (call after setting password)
+    pub fn encrypt_existing_messages(&self) -> Result<usize, DbError> {
+        let sk = match self.session_key {
+            Some(ref k) => k,
+            None => return Ok(0),
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT id, subject, body FROM messages WHERE subject NOT LIKE 'ENC:%'"
+        )?;
+        let rows: Vec<(i64, String, String)> = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?.filter_map(|r| r.ok()).collect();
+        let count = rows.len();
+        for (id, subject, body) in &rows {
+            let enc_subject = format!("ENC:{}", hex::encode(simple_encrypt(sk, subject.as_bytes())));
+            let enc_body = format!("ENC:{}", hex::encode(simple_encrypt(sk, body.as_bytes())));
+            self.conn.execute(
+                "UPDATE messages SET subject = ?1, body = ?2 WHERE id = ?3",
+                params![enc_subject, enc_body, id],
+            )?;
+        }
+        Ok(count)
+    }
+
+    /// Decrypt all encrypted messages (call when removing encryption)
+    pub fn decrypt_all_messages(&self) -> Result<usize, DbError> {
+        let sk = match self.session_key {
+            Some(ref k) => k,
+            None => return Ok(0),
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT id, subject, body FROM messages WHERE subject LIKE 'ENC:%'"
+        )?;
+        let rows: Vec<(i64, String, String)> = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?.filter_map(|r| r.ok()).collect();
+        let count = rows.len();
+        for (id, subject, body) in &rows {
+            let dec_subject = if let Some(s) = subject.strip_prefix("ENC:") {
+                if let Ok(bytes) = hex::decode(s) {
+                    if let Ok(dec) = simple_decrypt(sk, &bytes) {
+                        String::from_utf8(dec).unwrap_or_else(|_| subject.clone())
+                    } else { subject.clone() }
+                } else { subject.clone() }
+            } else { subject.clone() };
+            let dec_body = if let Some(s) = body.strip_prefix("ENC:") {
+                if let Ok(bytes) = hex::decode(s) {
+                    if let Ok(dec) = simple_decrypt(sk, &bytes) {
+                        String::from_utf8(dec).unwrap_or_else(|_| body.clone())
+                    } else { body.clone() }
+                } else { body.clone() }
+            } else { body.clone() };
+            self.conn.execute(
+                "UPDATE messages SET subject = ?1, body = ?2 WHERE id = ?3",
+                params![dec_subject, dec_body, id],
+            )?;
+        }
+        Ok(count)
     }
 }
 
