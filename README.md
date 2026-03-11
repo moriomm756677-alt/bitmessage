@@ -199,6 +199,10 @@ src/
     └── tray.rs             # System tray integration
 ```
 
+## Contact
+
+`BM-2cWLFTjX4jzDBPijR7aNLxMpHs1yqvHnZs`
+
 ## License
 
 MIT
